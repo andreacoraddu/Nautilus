@@ -1,10 +1,13 @@
 classdef PostProcessor
-    %PostProcessor Export hydrostatic/GZ results and generate plots.
+    % PostProcessor
+    % Export hydrostatic and GZ results and generate publication-style plots.
     %
-    % FIXED BUGS:
-    % 1. writeHydroTxt - Fixed division by zero risk in coefficient calculations
-    % 2. plotHydrostaticsBasic - Better handling of invalid data
-    % 3. yline compatibility note added
+    % Main improvements:
+    %   - clearer axis labels with proper physical meaning
+    %   - more polished and consistent plotting style
+    %   - improved legends, annotations, and zero-reference handling
+    %   - safer extraction of derived hydrostatic quantities
+    %   - richer hydrostatics figure with better visual hierarchy
 
     properties
         cfg struct
@@ -12,11 +15,16 @@ classdef PostProcessor
 
     methods
         function obj = PostProcessor(cfg)
+            if nargin < 1 || isempty(cfg)
+                cfg = struct();
+            end
             obj.cfg = cfg;
         end
 
         function generate(obj, outputTag, results, mesh, inputData)
             COND = results.COND;
+
+            obj.ensureOutputFolder();
 
             obj.writeHydroDat(outputTag, COND, inputData.VCG);
             obj.writeHydroTxt(outputTag, COND, inputData.VCG);
@@ -39,6 +47,12 @@ classdef PostProcessor
     end
 
     methods (Access = private)
+        function ensureOutputFolder(~)
+            if exist('Output', 'dir') ~= 7
+                mkdir('Output');
+            end
+        end
+
         function writeHydroDat(obj, outputTag, COND, vcg)
             datFile = fullfile('Output', ['Hydrostatics_', outputTag, '.dat']);
             fid = fopen(datFile, 'w');
@@ -46,27 +60,25 @@ classdef PostProcessor
                 warning('PostProcessor:FileOpen', 'Could not open %s for writing.', datFile);
                 return;
             end
+            cleaner = onCleanup(@() fclose(fid));
 
-            fprintf(fid, '# T[m]\t V[m3]\t XB[m]\t YB[m]\t ZB[m]\t Ix[m4]\t Iy[m4]\t BM[m]\t BML[m]\t KM[m]\t GM[m]\t GML[m]\t MCT[tm/cm]\t Af[m2]\t Lwl[m]\t Bwl[m]\t Ams[m2]\t Ws[m2]\t XF[m]\n');
+            fprintf(fid, '# T[m]\t V[m3]\t XB[m]\t YB[m]\t ZB[m]\t Ix[m4]\t Iy[m4]\t BMt[m]\t BMl[m]\t KMt[m]\t GMt[m]\t GMl[m]\t MCT[tm/cm]\t Af[m2]\t Lwl[m]\t Bwl[m]\t Ams[m2]\t Ws[m2]\t XF[m]\n');
+
             for k = 1:numel(COND)
                 c = COND(k);
-                if isnan(c.V)
+                if ~isfinite(c.V)
                     continue;
                 end
-                V   = c.V;
-                KB  = c.B(3);
-                BM  = c.I(1) / max(V, 1e-9);
-                BML = c.I(2) / max(V, 1e-9);
-                KM  = KB + BM;
-                GM  = KM - vcg;
-                GML = KB + BML - vcg;
-                Dlt = obj.cfg.rho * V / 1000;
-                MCT = Dlt * GML / max(100 * c.Lwl, 1e-9);
-                fprintf(fid, '%6.3f\t%10.3f\t%8.4f\t%8.4f\t%8.4f\t%12.3f\t%12.3f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\t%8.3f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\n', ...
-                    c.T, V, c.B(1), c.B(2), KB, c.I(1), c.I(2), BM, BML, KM, GM, GML, MCT, ...
+
+                hs = obj.computeDerivedHydro(c, vcg);
+
+                fprintf(fid, ...
+                    '%6.3f\t%10.3f\t%8.4f\t%8.4f\t%8.4f\t%12.3f\t%12.3f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\t%8.3f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\t%8.4f\n', ...
+                    c.T, c.V, c.B(1), c.B(2), c.B(3), c.I(1), c.I(2), ...
+                    hs.BMt, hs.BMl, hs.KMt, hs.GMt, hs.GMl, hs.MCT, ...
                     c.Af, c.Lwl, c.Bwl, c.Ams, c.Ws, c.F(1));
             end
-            fclose(fid);
+
             fprintf('  Written: %s\n', datFile);
         end
 
@@ -77,8 +89,8 @@ classdef PostProcessor
                 warning('PostProcessor:FileOpen', 'Could not open %s for writing.', txtFile);
                 return;
             end
+            cleaner = onCleanup(@() fclose(fid));
 
-            % Separator width matches the data table (~243 chars with 24 columns)
             sep = repmat('=', 1, 243);
             fprintf(fid, '%s\n', sep);
             fprintf(fid, '  NAUTILUS - Hydrostatic Results (Mesh)\n');
@@ -86,52 +98,28 @@ classdef PostProcessor
             fprintf(fid, '%s\n\n', sep);
 
             hdr = {'T[m]','V[m3]','Delta[t]','XB[m]','YB[m]','KB[m]', ...
-                'Ix[m4]','Iy[m4]','BM[m]','BML[m]','KM[m]','GM[m]','GML[m]','MCT[tm/cm]', ...
+                'Ix[m4]','Iy[m4]','BMt[m]','BMl[m]','KMt[m]','GMt[m]','GMl[m]','MCT[tm/cm]', ...
                 'Af[m2]','TPC[t/cm]','XF[m]','Lwl[m]','Bwl[m]','Ws[m2]','Cb','Cw','Cm','Cp'};
             fmt_h = '%-8s  %-10s  %-9s  %-8s  %-8s  %-8s  %-12s  %-12s  %-8s  %-9s  %-8s  %-8s  %-9s  %-10s  %-8s  %-9s  %-8s  %-8s  %-8s  %-8s  %-6s  %-6s  %-6s  %-6s\n';
             fprintf(fid, fmt_h, hdr{:});
             fprintf(fid, '%s\n', repmat('-', 1, 243));
 
             fmt_d = '%-8.3f  %-10.3f  %-9.2f  %-8.4f  %-8.4f  %-8.4f  %-12.3f  %-12.3f  %-8.4f  %-9.4f  %-8.4f  %-8.4f  %-9.4f  %-10.4f  %-8.3f  %-9.4f  %-8.4f  %-8.4f  %-8.4f  %-8.3f  %-6.4f  %-6.4f  %-6.4f  %-6.4f\n';
+
             for k = 1:numel(COND)
                 c = COND(k);
-                if isnan(c.V)
+                if ~isfinite(c.V)
                     continue;
                 end
 
-                V = c.V;
-                KB = c.B(3);
-                BM  = c.I(1) / max(V, 1e-9);
-                BML = c.I(2) / max(V, 1e-9);
-                KM  = KB + BM;
-                GM  = KM - vcg;
-                GML = KB + BML - vcg;
-                Dlt = obj.cfg.rho * V / 1000;
-                TPC = c.Af * obj.cfg.rho / (1000 * 100);
-                MCT = Dlt * GML / max(100 * c.Lwl, 1e-9);   % t·m/cm
-
-                % FIXED: Safer coefficient calculations with minimum denominators
-                denom_Cb = max(c.Lwl * c.Bwl * c.T, 1e-9);
-                denom_Cw = max(c.Lwl * c.Bwl, 1e-9);
-                denom_Cm = max(c.Bwl * c.T, 1e-9);
-                denom_Cp = max(c.Ams * c.Lwl, 1e-9);
-
-                Cb = V / denom_Cb;
-                Cw = c.Af / denom_Cw;
-                Cm = c.Ams / denom_Cm;
-                Cp = V / denom_Cp;
-
-                % Clamp coefficients to valid range [0, 1] (with small tolerance for numerical errors)
-                Cb = max(0, min(1.01, Cb));
-                Cw = max(0, min(1.01, Cw));
-                Cm = max(0, min(1.01, Cm));
-                Cp = max(0, min(1.01, Cp));
+                hs = obj.computeDerivedHydro(c, vcg);
 
                 fprintf(fid, fmt_d, ...
-                    c.T, V, Dlt, c.B(1), c.B(2), KB, c.I(1), c.I(2), BM, BML, KM, GM, GML, MCT, ...
-                    c.Af, TPC, c.F(1), c.Lwl, c.Bwl, c.Ws, Cb, Cw, Cm, Cp);
+                    c.T, c.V, hs.Delta, c.B(1), c.B(2), c.B(3), c.I(1), c.I(2), ...
+                    hs.BMt, hs.BMl, hs.KMt, hs.GMt, hs.GMl, hs.MCT, ...
+                    c.Af, hs.TPC, c.F(1), c.Lwl, c.Bwl, c.Ws, hs.Cb, hs.Cw, hs.Cm, hs.Cp);
             end
-            fclose(fid);
+
             fprintf('  Written: %s\n', txtFile);
         end
 
@@ -142,6 +130,7 @@ classdef PostProcessor
                 warning('PostProcessor:FileOpen', 'Could not open %s for writing.', datFile);
                 return;
             end
+            cleaner = onCleanup(@() fclose(fid));
 
             fprintf(fid, '# heel[deg]\t trim[deg]\t draft[m]\t GZ[m]\t V[m3]\t converged\n');
             for k = 1:numel(GZdata)
@@ -149,7 +138,7 @@ classdef PostProcessor
                 fprintf(fid, '%8.3f\t%8.4f\t%8.4f\t%8.5f\t%12.4f\t%d\n', ...
                     g.heel, g.trim, g.draft, g.GZ, g.V, g.conv);
             end
-            fclose(fid);
+
             fprintf('  Written: %s\n', datFile);
         end
 
@@ -160,6 +149,7 @@ classdef PostProcessor
                 warning('PostProcessor:FileOpen', 'Could not open %s for writing.', txtFile);
                 return;
             end
+            cleaner = onCleanup(@() fclose(fid));
 
             fprintf(fid, 'NAUTILUS - GZ Curve Results\n');
             fprintf(fid, '%s\n', repmat('=', 1, 70));
@@ -177,22 +167,25 @@ classdef PostProcessor
                     g.heel, g.trim, g.draft, g.GZ, g.V, status);
             end
 
-            % Stability summary block
             heelAll = [GZdata.heel];
             gzAll   = [GZdata.GZ];
             valid   = isfinite(heelAll) & isfinite(gzAll);
+
             if any(valid)
                 heelV = heelAll(valid);
                 gzV   = gzAll(valid);
+
                 [gzMax, iMax] = max(gzV);
                 heelMax = heelV(iMax);
-                iZero   = find(gzV < 0, 1, 'first');
+
+                iZero = find(gzV < 0, 1, 'first');
                 if ~isempty(iZero) && iZero > 1
                     heelZero = interp1(gzV(iZero-1:iZero), heelV(iZero-1:iZero), 0, 'linear', 'extrap');
                 else
                     heelZero = NaN;
                 end
-                gzArea = trapz(heelV * pi/180, gzV);   % m·rad
+
+                gzArea = trapz(deg2rad(heelV), gzV);
 
                 fprintf(fid, '\n%s\n', repmat('-', 1, 70));
                 fprintf(fid, 'Stability Summary\n');
@@ -203,67 +196,70 @@ classdef PostProcessor
                 fprintf(fid, '  GZ area:  %.4f m*rad\n', gzArea);
             end
 
-            fclose(fid);
             fprintf('  Written: %s\n', txtFile);
         end
 
         function plotGZ(obj, outputTag, GZdata)
             heel = [GZdata.heel];
-            gz = [GZdata.GZ];
-            ok = isfinite(heel) & isfinite(gz);
+            gz   = [GZdata.GZ];
+            ok   = isfinite(heel) & isfinite(gz);
+
             if ~any(ok)
                 return;
             end
 
+            heel = heel(ok);
+            gz   = gz(ok);
+
             C = obj.publicationColors();
-            fig = obj.createPublicationFigure([160 120 980 620]);
+            fig = obj.createPublicationFigure([160 120 1020 650]);
             ax = axes('Parent', fig);
             hold(ax, 'on');
 
-            plot(ax, heel(ok), gz(ok), '-o', ...
-                'LineWidth', 2.4, ...
+            obj.drawZeroLine(ax, C);
+
+            plot(ax, heel, gz, '-o', ...
+                'LineWidth', 2.8, ...
                 'Color', C.blue, ...
-                'MarkerSize', 6.5, ...
-                'MarkerFaceColor', 'white', ...
+                'MarkerSize', 6.8, ...
+                'MarkerFaceColor', [1 1 1], ...
                 'MarkerEdgeColor', C.blue);
 
-            % FIXED: Check for yline availability (MATLAB R2018b+)
-            % For older versions, use plot instead
-            if exist('yline', 'file') == 2
-                yline(ax, 0, '--', ...
-                    'Color', C.red, ...
-                    'LineWidth', 1.3, ...
-                    'HandleVisibility', 'off');
-            else
-                plot(ax, xlim(ax), [0 0], '--', ...
-                    'Color', C.red, ...
-                    'LineWidth', 1.3, ...
-                    'HandleVisibility', 'off');
-            end
+            % light area fill under positive GZ
+            gzFill = gz;
+            gzFill(gzFill < 0) = 0;
+            patch(ax, [heel, fliplr(heel)], [gzFill, zeros(size(gzFill))], C.blue, ...
+                'FaceAlpha', 0.10, 'EdgeColor', 'none', 'HandleVisibility', 'off');
 
-            gzValid = gz(ok);
-            heelValid = heel(ok);
-            [gzPeak, iPeak] = max(gzValid);
-            heelPeak = heelValid(iPeak);
+            [gzPeak, iPeak] = max(gz);
+            heelPeak = heel(iPeak);
+
             plot(ax, heelPeak, gzPeak, 'p', ...
-                'MarkerSize', 12, ...
-                'LineWidth', 1.2, ...
+                'MarkerSize', 13, ...
+                'LineWidth', 1.3, ...
                 'MarkerFaceColor', C.gold, ...
-                'MarkerEdgeColor', C.dark);
+                'MarkerEdgeColor', C.dark, ...
+                'DisplayName', '$GZ_{\max}$');
+
             text(ax, heelPeak, gzPeak, ...
-                sprintf('$\\max\\,GZ = %.3f\\,\\mathrm{m}\\ \\mathrm{at}\\ %.1f^\\circ$', gzPeak, heelPeak), ...
+                sprintf('$\\;GZ_{\\max}=%.3f\\,\\mathrm{m}\\ @\\ %.1f^\\circ$', gzPeak, heelPeak), ...
                 'Interpreter', 'latex', ...
                 'FontSize', 12, ...
                 'Color', C.dark, ...
-                'VerticalAlignment', 'bottom');
+                'VerticalAlignment', 'bottom', ...
+                'HorizontalAlignment', 'left');
 
             obj.styleAxes(ax);
+            xlim(ax, [min(heel), max(heel)]);
+
+            % Better labels
             xlabel(ax, '$\phi\,[^\circ]$', 'Interpreter', 'latex');
-            ylabel(ax, '$GZ\,[\mathrm{m}]$', 'Interpreter', 'latex');
+            ylabel(ax, '$GZ\;[\mathrm{m}]$', 'Interpreter', 'latex');
+
             obj.applyAxesTitle(ax, 'Righting Lever Curve');
             legend(ax, {'$GZ(\phi)$', '$GZ_{\max}$'}, ...
                 'Interpreter', 'latex', ...
-                'Location', 'best', ...
+                'Location', 'northwest', ...
                 'Box', 'off');
 
             if obj.cfg.savePlots
@@ -272,120 +268,309 @@ classdef PostProcessor
         end
 
         function plotHydrostaticsBasic(obj, outputTag, COND, vcg)
-            % Extract data with validation
-            T = [COND.T];
-            V = [COND.V];
-            
-            % Handle potential NaN in B field
-            KB = nan(size(T));
-            for i = 1:numel(COND)
-                if ~isnan(COND(i).B(3))
-                    KB(i) = COND(i).B(3);
-                end
-            end
-            
-            BM = nan(size(T));
-            for i = 1:numel(COND)
-                if ~isnan(COND(i).V) && COND(i).V > 0 && ~isnan(COND(i).I(1))
-                    BM(i) = COND(i).I(1) / max(COND(i).V, 1e-9);
-                end
-            end
-            
-            KM = KB + BM;
-            GM = KM - vcg;
-            
-            Af = [COND.Af];
-            Lwl = [COND.Lwl];
-            Bwl = [COND.Bwl];
+            % Compute all hydrostatic arrays once
+            HS = obj.extractHydroArrays(COND, vcg);
 
-            valid = isfinite(T) & isfinite(V) & V > 0;
+            valid = isfinite(HS.T) & isfinite(HS.V) & HS.V > 0;
             if ~any(valid)
-                warning('PostProcessor:NoValidData', 'No valid data for plotting.');
+                warning('PostProcessor:NoValidData', 'No valid hydrostatic data available for plotting.');
                 return;
             end
 
             C = obj.publicationColors();
-            fig = obj.createPublicationFigure([120 110 1180 760]);
-            tl = tiledlayout(fig, 2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+            fig = obj.createPublicationFigure([90 70 1320 860]);
+            tl = tiledlayout(fig, 2, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
 
+            % -----------------------------------------------------------------
+            % 1) Displacement
+            % -----------------------------------------------------------------
             ax = nexttile(tl, 1);
-            plot(ax, T(valid), V(valid), '-o', ...
-                'LineWidth', 2.1, ...
+            hold(ax, 'on');
+            plot(ax, HS.T(valid), HS.V(valid), '-o', ...
+                'LineWidth', 2.5, ...
                 'Color', C.blue, ...
-                'MarkerSize', 6, ...
+                'MarkerSize', 6.0, ...
                 'MarkerFaceColor', 'white', ...
                 'MarkerEdgeColor', C.blue);
+            obj.fillUnderCurve(ax, HS.T(valid), HS.V(valid), C.blue, 0.08);
             obj.styleAxes(ax);
-            xlabel(ax, '$T\,[\mathrm{m}]$', 'Interpreter', 'latex');
-            ylabel(ax, '$V\,[\mathrm{m}^3]$', 'Interpreter', 'latex');
-            obj.applyAxesTitle(ax, 'Displacement Curve');
+            xlabel(ax, '$T\;[\mathrm{m}]$', 'Interpreter', 'latex');
+            ylabel(ax, '$\nabla\;[\mathrm{m}^3]$', 'Interpreter', 'latex');
+            obj.applyAxesTitle(ax, 'Displacement Volume');
 
+            % -----------------------------------------------------------------
+            % 2) Stability heights
+            % -----------------------------------------------------------------
             ax = nexttile(tl, 2);
-            valid_stab = valid & isfinite(KB) & isfinite(KM) & isfinite(GM);
-            if any(valid_stab)
-                hold(ax, 'on');
-                plot(ax, T(valid_stab), KB(valid_stab), '-o', ...
-                    'LineWidth', 2.0, 'Color', C.green, ...
-                    'MarkerSize', 5.5, 'MarkerFaceColor', 'white');
-                plot(ax, T(valid_stab), KM(valid_stab), '-s', ...
-                    'LineWidth', 2.0, 'Color', C.orange, ...
-                    'MarkerSize', 5.5, 'MarkerFaceColor', 'white');
-                plot(ax, T(valid_stab), GM(valid_stab), '-^', ...
-                    'LineWidth', 2.0, 'Color', C.purple, ...
-                    'MarkerSize', 5.5, 'MarkerFaceColor', 'white');
-                if any(isfinite(GM(valid_stab)))
-                    if exist('yline', 'file') == 2
-                        yline(ax, 0, ':', 'Color', C.red, 'LineWidth', 1.0, 'HandleVisibility', 'off');
-                    else
-                        plot(ax, xlim(ax), [0 0], ':', 'Color', C.red, 'LineWidth', 1.0, 'HandleVisibility', 'off');
-                    end
-                end
-                legend(ax, {'$KB$', '$KM$', '$GM$'}, ...
-                    'Interpreter', 'latex', 'Location', 'best', 'Box', 'off');
+            validStab = valid & isfinite(HS.KB) & isfinite(HS.KMt) & isfinite(HS.GMt);
+            hold(ax, 'on');
+            if any(validStab)
+                plot(ax, HS.T(validStab), HS.KB(validStab), '-o', ...
+                    'LineWidth', 2.1, 'Color', C.green, ...
+                    'MarkerSize', 5.5, 'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$KB$');
+
+                plot(ax, HS.T(validStab), HS.KMt(validStab), '-s', ...
+                    'LineWidth', 2.1, 'Color', C.orange, ...
+                    'MarkerSize', 5.5, 'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$KM_t$');
+
+                plot(ax, HS.T(validStab), HS.GMt(validStab), '-^', ...
+                    'LineWidth', 2.1, 'Color', C.purple, ...
+                    'MarkerSize', 5.5, 'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$GM_t$');
+
+                obj.drawZeroLine(ax, C);
+                legend(ax, 'Interpreter', 'latex', 'Location', 'best', 'Box', 'off');
             end
             obj.styleAxes(ax);
-            xlabel(ax, '$T\,[\mathrm{m}]$', 'Interpreter', 'latex');
-            ylabel(ax, '$[\mathrm{m}]$', 'Interpreter', 'latex');
-            obj.applyAxesTitle(ax, 'Stability Heights');
+            xlabel(ax, '$T\;[\mathrm{m}]$', 'Interpreter', 'latex');
+            ylabel(ax, '$\mathrm{Height}\;[\mathrm{m}]$', 'Interpreter', 'latex');
+            obj.applyAxesTitle(ax, 'Transverse Stability Heights');
 
+            % -----------------------------------------------------------------
+            % 3) Waterplane area and wetted surface
+            % -----------------------------------------------------------------
             ax = nexttile(tl, 3);
-            valid_wp = valid & isfinite(Af);
-            if any(valid_wp)
-                plot(ax, T(valid_wp), Af(valid_wp), '-o', ...
-                    'LineWidth', 2.1, ...
+            validArea = valid & isfinite(HS.Af) & isfinite(HS.Ws);
+            hold(ax, 'on');
+            if any(validArea)
+                plot(ax, HS.T(validArea), HS.Af(validArea), '-o', ...
+                    'LineWidth', 2.2, ...
                     'Color', C.teal, ...
-                    'MarkerSize', 6, ...
+                    'MarkerSize', 5.8, ...
                     'MarkerFaceColor', 'white', ...
-                    'MarkerEdgeColor', C.teal);
-            end
-            obj.styleAxes(ax);
-            xlabel(ax, '$T\,[\mathrm{m}]$', 'Interpreter', 'latex');
-            ylabel(ax, '$A_{\mathrm{WP}}\,[\mathrm{m}^2]$', 'Interpreter', 'latex');
-            obj.applyAxesTitle(ax, 'Waterplane Area');
+                    'DisplayName', '$A_{\mathrm{WP}}$');
 
-            ax = nexttile(tl, 4);
-            valid_dims = valid & isfinite(Lwl) & isfinite(Bwl);
-            if any(valid_dims)
-                hold(ax, 'on');
-                plot(ax, T(valid_dims), Lwl(valid_dims), '-o', ...
-                    'LineWidth', 2.0, 'Color', C.gold, ...
-                    'MarkerSize', 5.5, 'MarkerFaceColor', 'white');
-                plot(ax, T(valid_dims), Bwl(valid_dims), '-s', ...
-                    'LineWidth', 2.0, 'Color', C.dark, ...
-                    'MarkerSize', 5.5, 'MarkerFaceColor', 'white');
-                legend(ax, {'$L_{\mathrm{WL}}$', '$B_{\mathrm{WL}}$'}, ...
-                    'Interpreter', 'latex', 'Location', 'best', 'Box', 'off');
+                plot(ax, HS.T(validArea), HS.Ws(validArea), '-s', ...
+                    'LineWidth', 2.2, ...
+                    'Color', C.dark, ...
+                    'MarkerSize', 5.8, ...
+                    'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$S_{\mathrm{wet}}$');
+
+                legend(ax, 'Interpreter', 'latex', 'Location', 'northwest', 'Box', 'off');
             end
             obj.styleAxes(ax);
-            xlabel(ax, '$T\,[\mathrm{m}]$', 'Interpreter', 'latex');
-            ylabel(ax, '$[\mathrm{m}]$', 'Interpreter', 'latex');
+            xlabel(ax, '$T\;[\mathrm{m}]$', 'Interpreter', 'latex');
+            ylabel(ax, '$\mathrm{Area}\;[\mathrm{m}^2]$', 'Interpreter', 'latex');
+            obj.applyAxesTitle(ax, 'Waterplane and Wetted Areas');
+
+            % -----------------------------------------------------------------
+            % 4) Waterline dimensions
+            % -----------------------------------------------------------------
+            ax = nexttile(tl, 4);
+            validDims = valid & isfinite(HS.Lwl) & isfinite(HS.Bwl);
+            hold(ax, 'on');
+            if any(validDims)
+                plot(ax, HS.T(validDims), HS.Lwl(validDims), '-o', ...
+                    'LineWidth', 2.2, ...
+                    'Color', C.gold, ...
+                    'MarkerSize', 5.8, ...
+                    'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$L_{\mathrm{WL}}$');
+
+                plot(ax, HS.T(validDims), HS.Bwl(validDims), '-s', ...
+                    'LineWidth', 2.2, ...
+                    'Color', C.blue2, ...
+                    'MarkerSize', 5.8, ...
+                    'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$B_{\mathrm{WL}}$');
+
+                legend(ax, 'Interpreter', 'latex', 'Location', 'best', 'Box', 'off');
+            end
+            obj.styleAxes(ax);
+            xlabel(ax, '$T\;[\mathrm{m}]$', 'Interpreter', 'latex');
+            ylabel(ax, '$\mathrm{Length}\;[\mathrm{m}]$', 'Interpreter', 'latex');
             obj.applyAxesTitle(ax, 'Waterline Dimensions');
+
+            % -----------------------------------------------------------------
+            % 5) Hydrostatic coefficients
+            % -----------------------------------------------------------------
+            ax = nexttile(tl, 5);
+            validCoeff = valid & isfinite(HS.Cb) & isfinite(HS.Cw) & isfinite(HS.Cm) & isfinite(HS.Cp);
+            hold(ax, 'on');
+            if any(validCoeff)
+                plot(ax, HS.T(validCoeff), HS.Cb(validCoeff), '-o', ...
+                    'LineWidth', 2.0, 'Color', C.blue, ...
+                    'MarkerSize', 5.2, 'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$C_B$');
+
+                plot(ax, HS.T(validCoeff), HS.Cw(validCoeff), '-s', ...
+                    'LineWidth', 2.0, 'Color', C.green, ...
+                    'MarkerSize', 5.2, 'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$C_W$');
+
+                plot(ax, HS.T(validCoeff), HS.Cm(validCoeff), '-^', ...
+                    'LineWidth', 2.0, 'Color', C.orange, ...
+                    'MarkerSize', 5.2, 'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$C_M$');
+
+                plot(ax, HS.T(validCoeff), HS.Cp(validCoeff), '-d', ...
+                    'LineWidth', 2.0, 'Color', C.purple, ...
+                    'MarkerSize', 5.2, 'MarkerFaceColor', 'white', ...
+                    'DisplayName', '$C_P$');
+
+                ylim(ax, [0, max(1.05, 1.05*max([HS.Cb(validCoeff), HS.Cw(validCoeff), HS.Cm(validCoeff), HS.Cp(validCoeff)]))]);
+                legend(ax, 'Interpreter', 'latex', 'Location', 'best', 'Box', 'off');
+            end
+            obj.styleAxes(ax);
+            xlabel(ax, '$T\;[\mathrm{m}]$', 'Interpreter', 'latex');
+            ylabel(ax, '$\mathrm{Coefficient}\;[-]$', 'Interpreter', 'latex');
+            obj.applyAxesTitle(ax, 'Hydrostatic Coefficients');
+
+            % -----------------------------------------------------------------
+            % 6) TPC and MCT
+            % -----------------------------------------------------------------
+            ax = nexttile(tl, 6);
+            validCap = valid & isfinite(HS.TPC) & isfinite(HS.MCT);
+            hold(ax, 'on');
+            if any(validCap)
+                yyaxis(ax, 'left');
+                plot(ax, HS.T(validCap), HS.TPC(validCap), '-o', ...
+                    'LineWidth', 2.2, ...
+                    'Color', C.teal, ...
+                    'MarkerSize', 5.8, ...
+                    'MarkerFaceColor', 'white');
+                ylabel(ax, '$TPC\;[\mathrm{t/cm}]$', 'Interpreter', 'latex');
+
+                yyaxis(ax, 'right');
+                plot(ax, HS.T(validCap), HS.MCT(validCap), '-s', ...
+                    'LineWidth', 2.2, ...
+                    'Color', C.red, ...
+                    'MarkerSize', 5.8, ...
+                    'MarkerFaceColor', 'white');
+                ylabel(ax, '$MCT_{1\mathrm{cm}}\;[\mathrm{t\,m/cm}]$', 'Interpreter', 'latex');
+
+                yyaxis(ax, 'left');
+            end
+            obj.styleAxes(ax);
+            xlabel(ax, '$T\;[\mathrm{m}]$', 'Interpreter', 'latex');
+            obj.applyAxesTitle(ax, 'Hydrostatic Stiffness Indicators');
 
             obj.applyLayoutTitle(tl, 'Hydrostatic Curves');
 
             if obj.cfg.savePlots
                 obj.exportFigure(fig, fullfile('Output', ['Hydrostatics_', outputTag]));
             end
+        end
+
+        function HS = extractHydroArrays(obj, COND, vcg)
+            n = numel(COND);
+
+            HS = struct();
+            HS.T   = nan(1,n);
+            HS.V   = nan(1,n);
+            HS.KB  = nan(1,n);
+            HS.BMt = nan(1,n);
+            HS.BMl = nan(1,n);
+            HS.KMt = nan(1,n);
+            HS.GMt = nan(1,n);
+            HS.GMl = nan(1,n);
+            HS.Af  = nan(1,n);
+            HS.Lwl = nan(1,n);
+            HS.Bwl = nan(1,n);
+            HS.Ams = nan(1,n);
+            HS.Ws  = nan(1,n);
+            HS.TPC = nan(1,n);
+            HS.MCT = nan(1,n);
+            HS.Cb  = nan(1,n);
+            HS.Cw  = nan(1,n);
+            HS.Cm  = nan(1,n);
+            HS.Cp  = nan(1,n);
+
+            for i = 1:n
+                c = COND(i);
+
+                HS.T(i)   = c.T;
+                HS.V(i)   = c.V;
+                HS.KB(i)  = c.B(3);
+                HS.Af(i)  = c.Af;
+                HS.Lwl(i) = c.Lwl;
+                HS.Bwl(i) = c.Bwl;
+                HS.Ams(i) = c.Ams;
+                HS.Ws(i)  = c.Ws;
+
+                if ~isfinite(c.V) || c.V <= 0
+                    continue;
+                end
+
+                hs = obj.computeDerivedHydro(c, vcg);
+                HS.BMt(i) = hs.BMt;
+                HS.BMl(i) = hs.BMl;
+                HS.KMt(i) = hs.KMt;
+                HS.GMt(i) = hs.GMt;
+                HS.GMl(i) = hs.GMl;
+                HS.TPC(i) = hs.TPC;
+                HS.MCT(i) = hs.MCT;
+                HS.Cb(i)  = hs.Cb;
+                HS.Cw(i)  = hs.Cw;
+                HS.Cm(i)  = hs.Cm;
+                HS.Cp(i)  = hs.Cp;
+            end
+        end
+
+        function hs = computeDerivedHydro(obj, c, vcg)
+            tiny = 1e-9;
+
+            V = c.V;
+            KB = c.B(3);
+            BMt = c.I(1) / max(V, tiny);
+            BMl = c.I(2) / max(V, tiny);
+            KMt = KB + BMt;
+            GMt = KMt - vcg;
+            GMl = KB + BMl - vcg;
+            Delta = obj.cfg.rho * V / 1000;
+            TPC = c.Af * obj.cfg.rho / (1000 * 100);
+            MCT = Delta * GMl / max(100 * c.Lwl, tiny);
+
+            denomCb = max(c.Lwl * c.Bwl * c.T, tiny);
+            denomCw = max(c.Lwl * c.Bwl, tiny);
+            denomCm = max(c.Bwl * c.T, tiny);
+            denomCp = max(c.Ams * c.Lwl, tiny);
+
+            Cb = obj.clamp01(V / denomCb);
+            Cw = obj.clamp01(c.Af / denomCw);
+            Cm = obj.clamp01(c.Ams / denomCm);
+            Cp = obj.clamp01(V / denomCp);
+
+            hs = struct();
+            hs.V = V;
+            hs.KB = KB;
+            hs.BMt = BMt;
+            hs.BMl = BMl;
+            hs.KMt = KMt;
+            hs.GMt = GMt;
+            hs.GMl = GMl;
+            hs.Delta = Delta;
+            hs.TPC = TPC;
+            hs.MCT = MCT;
+            hs.Cb = Cb;
+            hs.Cw = Cw;
+            hs.Cm = Cm;
+            hs.Cp = Cp;
+        end
+
+        function y = clamp01(~, x)
+            y = max(0, min(1.01, x));
+        end
+
+        function drawZeroLine(~, ax, C)
+            xl = xlim(ax);
+            plot(ax, xl, [0 0], '--', ...
+                'Color', C.red, ...
+                'LineWidth', 1.1, ...
+                'HandleVisibility', 'off');
+        end
+
+        function fillUnderCurve(~, ax, x, y, color, alphaVal)
+            if numel(x) < 2 || numel(y) < 2
+                return;
+            end
+            patch(ax, [x, fliplr(x)], [y, zeros(size(y))], color, ...
+                'FaceAlpha', alphaVal, ...
+                'EdgeColor', 'none', ...
+                'HandleVisibility', 'off');
         end
 
         function hideAxesToolbars(~, fig)
@@ -412,14 +597,14 @@ classdef PostProcessor
 
         function styleAxes(~, ax)
             ax.FontName = 'Times New Roman';
-            ax.FontSize = 13;
-            ax.LineWidth = 1.1;
+            ax.FontSize = 12.5;
+            ax.LineWidth = 1.05;
             ax.TickDir = 'out';
-            ax.TickLength = [0.015 0.015];
+            ax.TickLength = [0.014 0.014];
             ax.Box = 'on';
             ax.Layer = 'top';
-            ax.GridAlpha = 0.18;
-            ax.MinorGridAlpha = 0.10;
+            ax.GridAlpha = 0.14;
+            ax.MinorGridAlpha = 0.08;
             ax.XMinorGrid = 'on';
             ax.YMinorGrid = 'on';
             ax.XGrid = 'on';
@@ -431,12 +616,23 @@ classdef PostProcessor
             drawnow;
             obj.hideAxesToolbars(fig);
             set(fig, 'PaperPositionMode', 'auto');
-            print(fig, [basePath, '.png'], '-dpng', '-r300');
-            print(fig, [basePath, '.pdf'], '-dpdf', '-painters');
+
+            print(fig, [basePath, '.png'], '-dpng', '-r350');
+            fprintf('  Saved:   %s.png\n', basePath);
+
+            try
+                print(fig, [basePath, '.pdf'], '-dpdf', '-painters');
+                fprintf('  Saved:   %s.pdf\n', basePath);
+            catch ME
+                warning('PostProcessor:PDFExportFailed', ...
+                    'Could not export PDF for %s: %s', basePath, ME.message);
+            end
         end
 
         function applyAxesTitle(obj, target, heading)
-            title(target, obj.latexHeading(heading), 'Interpreter', 'latex');
+            title(target, obj.latexHeading(heading), ...
+                'Interpreter', 'latex', ...
+                'FontSize', 14);
         end
 
         function applyLayoutTitle(obj, target, heading)
@@ -468,14 +664,15 @@ classdef PostProcessor
 
         function C = publicationColors(~)
             C = struct();
-            C.blue = [0.07 0.32 0.62];
-            C.green = [0.13 0.55 0.23];
+            C.blue   = [0.07 0.32 0.62];
+            C.blue2  = [0.23 0.53 0.82];
+            C.green  = [0.13 0.55 0.23];
             C.orange = [0.82 0.39 0.06];
             C.purple = [0.43 0.21 0.62];
-            C.teal = [0.02 0.52 0.58];
-            C.gold = [0.78 0.58 0.12];
-            C.red = [0.70 0.16 0.16];
-            C.dark = [0.18 0.18 0.18];
+            C.teal   = [0.02 0.52 0.58];
+            C.gold   = [0.78 0.58 0.12];
+            C.red    = [0.70 0.16 0.16];
+            C.dark   = [0.18 0.18 0.18];
         end
     end
 end

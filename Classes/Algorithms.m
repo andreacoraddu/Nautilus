@@ -1,95 +1,96 @@
 classdef Algorithms
-    %Algorithms Core mesh hydrostatics and stability algorithms.
+    % Algorithms
+    % Core hydrostatics and stability algorithms for triangulated hull meshes.
     %
-    % FIXED BUGS:
-    % 1. computeRightingLever - Fixed sign logic using proper cross product
-    % 2. computeWaterplaneProperties - Fixed to handle edge cases and return NaN for invalid
-    % 3. computeTrimCorrection - Fixed sign convention
-    % 4. clipTriangleToWaterplane - Fixed edge cases
+    % Main improvements:
+    %   - centralised tolerances
+    %   - safer clipping of partially submerged triangles
+    %   - better defensive checks for invalid intermediate states
+    %   - more robust equilibrium iteration logic
+    %   - clearer righting lever computation and sign convention
+    %   - more robust handling of degenerate waterplane and section cases
+    %
+    % Important limitation:
+    %   Waterplane and midship-section reconstruction still rely on point-cloud
+    %   ordering, which is acceptable for simple single-hull geometries but not
+    %   fully reliable for disconnected or strongly non-convex sections.
+
+    properties (Constant, Access = private)
+        TOL_GEOM   = 1e-12;
+        TOL_AREA   = 1e-10;
+        TOL_VOLUME = 1e-12;
+        TOL_ANGLE  = 1e-12;
+        MAX_TRIM_STEP_DEG = 10;
+        MIN_WP_AREA = 1e-8;
+        MIN_VOL = 1e-10;
+    end
 
     methods (Static)
-        function [COND1, submergedMesh] = geometriaMesh(COND, mesh, varargin)
-            % varargin absorbs any legacy plottami argument; it is no longer used.
-
-            validateattributes(COND.T, {'numeric'}, {'scalar', 'real'}, 'Algorithms.geometriaMesh', 'T');
-            validateattributes(COND.tetaT, {'numeric'}, {'scalar', 'real'}, 'Algorithms.geometriaMesh', 'tetaT');
-            validateattributes(COND.tetaL, {'numeric'}, {'scalar', 'real'}, 'Algorithms.geometriaMesh', 'tetaL');
+        function [COND1, submergedMesh] = geometriaMesh(COND, mesh, varargin) %#ok<INUSD>
+            validateattributes(COND.T,     {'numeric'}, {'scalar','real','finite'}, 'Algorithms.geometriaMesh', 'COND.T');
+            validateattributes(COND.tetaT, {'numeric'}, {'scalar','real','finite'}, 'Algorithms.geometriaMesh', 'COND.tetaT');
+            validateattributes(COND.tetaL, {'numeric'}, {'scalar','real','finite'}, 'Algorithms.geometriaMesh', 'COND.tetaL');
 
             if ~isstruct(mesh) || ~isfield(mesh, 'vertices') || ~isfield(mesh, 'faces')
-                error('Algorithms:InvalidMesh', 'mesh must include vertices and faces.');
+                error('Algorithms:InvalidMesh', 'mesh must contain fields "vertices" and "faces".');
             end
 
-            vertices = mesh.vertices;
-            faces = mesh.faces;
-            nFaces = size(faces, 1);
+            V = double(mesh.vertices);
+            F = double(mesh.faces);
 
-            tetaT = COND.tetaT * pi / 180;
-            tetaL = COND.tetaL * pi / 180;
-            TM = COND.T;
+            if isempty(V) || isempty(F) || size(V,2) ~= 3 || size(F,2) ~= 3
+                error('Algorithms:InvalidMeshShape', 'Mesh vertices/faces must be Nx3 / Mx3 arrays.');
+            end
 
-            R_T = [1, 0, 0; 0, cos(tetaT), -sin(tetaT); 0, sin(tetaT), cos(tetaT)];
-            R_L = [cos(tetaL), 0, sin(tetaL); 0, 1, 0; -sin(tetaL), 0, cos(tetaL)];
-            R = R_L * R_T;
+            nFaces = size(F, 1);
 
-            vertices_world = (R * vertices')';
-            vertices_world(:, 3) = vertices_world(:, 3) - TM;
+            phi   = deg2rad(COND.tetaT); % heel / roll
+            theta = deg2rad(COND.tetaL); % trim / pitch
+            Tm    = COND.T;
 
-            maxSubmergedFaces = nFaces * 3;
-            subV = zeros(maxSubmergedFaces * 3, 3);
-            subF = zeros(maxSubmergedFaces, 3);
+            R = Algorithms.buildRotation(theta, phi);
+
+            % Ship frame -> world frame, then shift waterplane to z=0
+            Vw = (R * V')';
+            Vw(:,3) = Vw(:,3) - Tm;
+
+            maxSubFaces = 3 * nFaces;
+            subV = zeros(3 * maxSubFaces, 3);
+            subF = zeros(maxSubFaces, 3);
+
+            % Waterplane intersection points only; not edges-as-polygons
+            wpPts = zeros(2 * nFaces, 3);
+
             nSub = 0;
-            waterEdges = zeros(nFaces * 2, 3);
-            nWaterEdges = 0;
+            nWp  = 0;
             wettedArea = 0;
 
             for f = 1:nFaces
-                vIdx = faces(f, :);
-                v = vertices_world(vIdx, :);
+                tri = Vw(F(f,:), :);
+                z = tri(:,3);
 
-                z = v(:, 3);
-                zMin = min(z);
-                zMax = max(z);
-
-                if zMin > 0
+                if min(z) > Algorithms.TOL_GEOM
                     continue;
                 end
 
-                if zMax <= 0
-                    nSub = nSub + 1;
-                    idx = (nSub-1)*3 + (1:3);
-                    subV(idx, :) = v;
-                    subF(nSub, :) = idx;
+                if max(z) <= Algorithms.TOL_GEOM
+                    [subV, subF, nSub, wettedArea] = Algorithms.appendTriangle(subV, subF, nSub, wettedArea, tri);
+                    continue;
+                end
 
-                    e1 = v(2, :) - v(1, :);
-                    e2 = v(3, :) - v(1, :);
-                    n_vec = cross(e1, e2);
-                    area = 0.5 * norm(n_vec);
-                    wettedArea = wettedArea + area;
-                else
-                    [clippedPoly, wpEdge] = Algorithms.clipTriangleToWaterplane(v);
+                [clippedPoly, wpLocal] = Algorithms.clipTriangleToWaterplane(tri);
 
-                    if ~isempty(wpEdge)
-                        nNew = size(wpEdge, 1);
-                        waterEdges(nWaterEdges + (1:nNew), :) = wpEdge;
-                        nWaterEdges = nWaterEdges + nNew;
-                    end
+                if ~isempty(wpLocal)
+                    nNew = size(wpLocal,1);
+                    wpPts(nWp + (1:nNew), :) = wpLocal;
+                    nWp = nWp + nNew;
+                end
 
-                    nClip = size(clippedPoly, 1);
-                    if nClip >= 3
-                        for t = 2:nClip-1
-                            tri = [clippedPoly(1, :); clippedPoly(t, :); clippedPoly(t+1, :)];
-
-                            nSub = nSub + 1;
-                            idx = (nSub-1)*3 + (1:3);
-                            subV(idx, :) = tri;
-                            subF(nSub, :) = idx;
-
-                            e1 = tri(2, :) - tri(1, :);
-                            e2 = tri(3, :) - tri(1, :);
-                            n_vec = cross(e1, e2);
-                            area = 0.5 * norm(n_vec);
-                            wettedArea = wettedArea + area;
-                        end
+                nClip = size(clippedPoly,1);
+                if nClip >= 3
+                    for k = 2:(nClip-1)
+                        triSub = [clippedPoly(1,:); clippedPoly(k,:); clippedPoly(k+1,:)];
+                        [subV, subF, nSub, wettedArea] = Algorithms.appendTriangle(subV, subF, nSub, wettedArea, triSub);
                     end
                 end
             end
@@ -100,63 +101,62 @@ classdef Algorithms
                 return;
             end
 
-            subV = subV(1:nSub*3, :);
+            subV = subV(1:3*nSub, :);
             subF = subF(1:nSub, :);
-            waterEdges = waterEdges(1:nWaterEdges, :);
+            wpPts = wpPts(1:nWp, :);
 
-            % Vectorised divergence-theorem accumulation (no loop over faces)
+            % Divergence-theorem accumulation on submerged triangulation
             V0m = subV(subF(:,1), :);
             V1m = subV(subF(:,2), :);
             V2m = subV(subF(:,3), :);
-            tetVols      = dot(V0m, cross(V1m, V2m, 2), 2) / 6;
-            signedVolume = sum(tetVols);
-            centroidAccum = sum(tetVols .* ((V0m + V1m + V2m) / 4), 1);
+
+            tetVol = dot(V0m, cross(V1m, V2m, 2), 2) / 6;
+            signedVolume = sum(tetVol);
+
+            centroidAccum = sum(tetVol .* ((V0m + V1m + V2m) / 4), 1);
 
             Volume = abs(signedVolume);
-            if abs(signedVolume) > 1e-12
+
+            if abs(signedVolume) > Algorithms.TOL_VOLUME
                 B_world = centroidAccum / signedVolume;
                 B_ship = (R' * B_world')';
-                B_ship(3) = B_ship(3) + TM;
+                B_ship(3) = B_ship(3) + Tm;
             else
                 B_ship = [NaN, NaN, NaN];
             end
 
-            [Af, Lwl, Bwl, F_world, Ix, Iy] = Algorithms.computeWaterplaneProperties(waterEdges);
+            [Af, Lwl, Bwl, F_world, Ix, Iy] = Algorithms.computeWaterplaneProperties(wpPts);
 
-            if Af > 0
+            if Af > 0 && all(isfinite(F_world))
                 F_ship = (R' * F_world')';
-                F_ship(3) = F_ship(3) + TM;
+                F_ship(3) = F_ship(3) + Tm;
             else
                 F_ship = [NaN, NaN, NaN];
             end
 
-            % Compute true midship cross-sectional area by slicing the
-            % submerged mesh at the longitudinal midpoint of the original hull.
-            xMid = (min(vertices(:,1)) + max(vertices(:,1))) / 2;
+            xMid = 0.5 * (min(V(:,1)) + max(V(:,1)));
             Ams = Algorithms.computeMidshipArea(subV, subF, xMid);
-            if Ams < 1e-12 && Lwl > 0
-                % Fallback: midship slice returned nothing (e.g. hull does not
-                % span x=0).  Use average section area; Cp/Cm will be inaccurate.
+
+            if Ams < Algorithms.TOL_AREA && Lwl > Algorithms.TOL_GEOM
                 Ams = Volume / Lwl;
             end
 
             COND1 = COND;
-            COND1.V = Volume;
-            COND1.B = B_ship;
-            COND1.Af = Af;
-            COND1.I = [Ix, Iy];
+            COND1.V   = Volume;
+            COND1.B   = B_ship;
+            COND1.Af  = Af;
+            COND1.I   = [Ix, Iy];
             COND1.Lwl = Lwl;
             COND1.Bwl = Bwl;
-            COND1.F = F_ship;
+            COND1.F   = F_ship;
             COND1.Ams = Ams;
-            COND1.Ws = wettedArea;
+            COND1.Ws  = wettedArea;
 
             submergedMesh = struct();
-            submergedMesh.vertices = subV;
-            submergedMesh.faces = (1:(nSub*3))';
-            submergedMesh.faces = reshape(submergedMesh.faces, 3, [])';
-            submergedMesh.nVertices = nSub * 3;
-            submergedMesh.nFaces = nSub;
+            submergedMesh.vertices  = subV;
+            submergedMesh.faces     = reshape(1:(3*nSub), 3, [])';
+            submergedMesh.nVertices = size(subV,1);
+            submergedMesh.nFaces    = size(subF,1);
         end
 
         function GZdata = computeGZcurve(SHIP, COND_ref, options)
@@ -164,28 +164,26 @@ classdef Algorithms
                 options = struct();
             end
 
-            if ~isfield(options, 'heelAngles'); options.heelAngles = 0:5:60; end
-            if ~isfield(options, 'useMesh'); options.useMesh = true; end
-            if ~isfield(options, 'tolVolume'); options.tolVolume = 1e-5; end
-            if ~isfield(options, 'tolTrim'); options.tolTrim = 1e-4; end
-            if ~isfield(options, 'parallel'); options.parallel = false; end
-            if ~isfield(options, 'verbose'); options.verbose = true; end
+            options = Algorithms.applyDefaults(options, struct( ...
+                'heelAngles', 0:5:60, ...
+                'useMesh', true, ...
+                'tolVolume', 1e-5, ...
+                'tolTrim', 1e-4, ...
+                'parallel', false, ...
+                'verbose', true));
 
-            heelAngles = options.heelAngles;
+            heelAngles = options.heelAngles(:).';
             nAngles = numel(heelAngles);
 
-            GZdata = struct('heel', num2cell(heelAngles), ...
-                            'trim', num2cell(nan(1, nAngles)), ...
-                            'draft', num2cell(nan(1, nAngles)), ...
-                            'GZ', num2cell(nan(1, nAngles)), ...
-                            'V', num2cell(nan(1, nAngles)), ...
-                            'conv', num2cell(false(1, nAngles)));
+            GZdata = repmat(struct( ...
+                'heel', nan, 'trim', nan, 'draft', nan, ...
+                'GZ', nan, 'V', nan, 'conv', false), 1, nAngles);
 
-            assettoOptions = struct();
-            assettoOptions.useMesh = options.useMesh;
-            assettoOptions.tolVolume = options.tolVolume;
-            assettoOptions.tolTrim = options.tolTrim;
-            assettoOptions.verbose = false;
+            assettoOptions = struct( ...
+                'useMesh', options.useMesh, ...
+                'tolVolume', options.tolVolume, ...
+                'tolTrim', options.tolTrim, ...
+                'verbose', false);
 
             if options.verbose
                 fprintf('\n========================================\n');
@@ -196,59 +194,52 @@ classdef Algorithms
                 fprintf('%s\n', repmat('-', 1, 60));
             end
 
-            tGZ = tic;  % Use a handle so this does not interfere with outer timers
+            t0 = tic;
+
             if options.parallel && license('test', 'Distrib_Computing_Toolbox')
-                % Parallel branch: collect all results first, then print in order.
-                gdArr(1:nAngles) = deal(struct('heel',nan,'trim',nan,'draft',nan,'GZ',nan,'V',nan,'conv',false));
+                tmp(1:nAngles) = GZdata(1);
                 parfor i = 1:nAngles
-                    gdArr(i) = Algorithms.computeSingleHeel(SHIP, COND_ref, heelAngles(i), assettoOptions);
+                    tmp(i) = Algorithms.computeSingleHeel(SHIP, COND_ref, heelAngles(i), assettoOptions);
                 end
-                for i = 1:nAngles
-                    GZdata(i) = gdArr(i);
-                    if options.verbose
-                        gd = GZdata(i);
-                        status = 'FAIL'; if gd.conv; status = 'OK'; end
-                        fprintf('%6.1f %8.3f %10.3f %10.4f %10.1f %8s\n', ...
-                            gd.heel, gd.trim, gd.draft, gd.GZ, gd.V, status);
-                    end
-                end
+                GZdata = tmp;
             else
-                % Serial branch (default)
                 for i = 1:nAngles
                     GZdata(i) = Algorithms.computeSingleHeel(SHIP, COND_ref, heelAngles(i), assettoOptions);
-                    if options.verbose
-                        gd = GZdata(i);
-                        status = 'FAIL'; if gd.conv; status = 'OK'; end
-                        fprintf('%6.1f %8.3f %10.3f %10.4f %10.1f %8s\n', ...
-                            gd.heel, gd.trim, gd.draft, gd.GZ, gd.V, status);
-                    end
                 end
             end
-            elapsed = toc(tGZ);
+
+            elapsed = toc(t0);
 
             if options.verbose
-                nConverged = sum([GZdata.conv]);
+                for i = 1:nAngles
+                    gd = GZdata(i);
+                    status = 'FAIL';
+                    if gd.conv, status = 'OK'; end
+                    fprintf('%6.1f %8.3f %10.3f %10.4f %10.1f %8s\n', ...
+                        gd.heel, gd.trim, gd.draft, gd.GZ, gd.V, status);
+                end
+
                 fprintf('%s\n', repmat('-', 1, 60));
-                fprintf('  Converged: %d/%d\n', nConverged, nAngles);
-                fprintf('  Time: %.2f s (%.3f s per angle)\n', elapsed, elapsed/nAngles);
+                fprintf('  Converged: %d/%d\n', sum([GZdata.conv]), nAngles);
+                fprintf('  Time: %.2f s (%.3f s per angle)\n', elapsed, elapsed / max(nAngles,1));
 
                 GZvals = [GZdata.GZ];
-                valid = ~isnan(GZvals);
-                validIdx = find(valid);
-                if ~isempty(validIdx)
-                    [GZmax, iMax] = max(GZvals(validIdx));
-                    heelMax = heelAngles(validIdx);
-                    heelMax = heelMax(iMax);
-                    iZero = find(GZvals(validIdx) < 0, 1, 'first');
-                    if ~isempty(iZero) && iZero > 1
-                        iPair = validIdx(iZero-1:iZero);
-                        heelZero = interp1(GZvals(iPair), heelAngles(iPair), 0, 'linear', 'extrap');
-                    else
-                        heelZero = nan;
+                valid = isfinite(GZvals);
+                if any(valid)
+                    hv = heelAngles(valid);
+                    gv = GZvals(valid);
+
+                    [GZmax, idxMax] = max(gv);
+                    heelMax = hv(idxMax);
+
+                    heelZero = nan;
+                    idxSign = find(gv < 0, 1, 'first');
+                    if ~isempty(idxSign) && idxSign > 1
+                        pair = idxSign-1:idxSign;
+                        heelZero = interp1(gv(pair), hv(pair), 0, 'linear', 'extrap');
                     end
-                    % Area under the GZ curve (stability energy index)
-                    heelRad = heelAngles(validIdx) * pi / 180;
-                    gzArea  = trapz(heelRad, GZvals(validIdx));
+
+                    gzArea = trapz(deg2rad(hv), gv);
 
                     fprintf('\n  Stability Summary:\n');
                     fprintf('    Max GZ:     %.4f m at %.1f°\n', GZmax, heelMax);
@@ -265,18 +256,19 @@ classdef Algorithms
                 options = struct();
             end
 
-            if ~isfield(options, 'useMesh'); options.useMesh = true; end
-            if ~isfield(options, 'tolVolume'); options.tolVolume = 1e-5; end
-            if ~isfield(options, 'tolTrim'); options.tolTrim = 1e-4; end
-            if ~isfield(options, 'maxIter'); options.maxIter = 100; end
-            if ~isfield(options, 'relaxation'); options.relaxation = 0.8; end
-            if ~isfield(options, 'verbose'); options.verbose = true; end
+            options = Algorithms.applyDefaults(options, struct( ...
+                'useMesh', true, ...
+                'tolVolume', 1e-5, ...
+                'tolTrim', 1e-4, ...
+                'maxIter', 100, ...
+                'relaxation', 0.8, ...
+                'verbose', true));
 
             Algorithms.validateInputs(COND, SHIP, options);
 
             V0 = COND.V;
-            if abs(V0) < 1e-10
-                error('Algorithms:zeroVolume', 'Target volume V0 = %.3e is too small.', V0);
+            if ~isfinite(V0) || abs(V0) < Algorithms.MIN_VOL
+                error('Algorithms:ZeroTargetVolume', 'Target displacement volume V0 is too small or invalid.');
             end
 
             if options.verbose
@@ -290,20 +282,18 @@ classdef Algorithms
             COND1.tetaL = 0;
             COND1 = geometryFunc(COND1);
 
-            history = struct();
-            history.volume = [];
-            history.trim = [];
-            history.draft = [];
+            history = struct('volume', [], 'trim', [], 'draft', []);
 
             [COND1, iterV0, convV0] = Algorithms.solveVolumeEquilibrium(COND1, V0, geometryFunc, options);
-            history.volume = [history.volume; COND1.V];
-            history.draft = [history.draft; COND1.T];
+            history.volume(end+1,1) = COND1.V;
+            history.draft(end+1,1)  = COND1.T;
 
             if options.verbose
                 fprintf('  Phase 1 (Volume):  %d iters, dV/V = %.2e\n', iterV0, convV0);
             end
 
             [COND1, iterTrim, convTrim, history] = Algorithms.solveTrimEquilibrium(COND1, V0, geometryFunc, options, history);
+
             if options.verbose
                 fprintf('  Phase 2 (Trim):    %d iters, dθ = %.2e°\n', iterTrim, convTrim);
             end
@@ -315,163 +305,212 @@ classdef Algorithms
                 fprintf('  Final: T=%.3f m, trim=%.4f°, GZ=%+.4f m\n', COND1.T, COND1.tetaL, COND1.GZ);
             end
 
-            COND1.conv.iterV0 = iterV0;
-            COND1.conv.iterTrim = iterTrim;
-            COND1.conv.dVfinal = (COND1.V - V0) / V0;
-            COND1.conv.dtlFinal = convTrim;
-            COND1.conv.converged = abs(COND1.conv.dVfinal) < options.tolVolume && abs(COND1.conv.dtlFinal) < options.tolTrim;
-            COND1.conv.history = history;
+            COND1.conv = struct();
+            COND1.conv.iterV0     = iterV0;
+            COND1.conv.iterTrim   = iterTrim;
+            COND1.conv.dVfinal    = (COND1.V - V0) / V0;
+            COND1.conv.dtlFinal   = convTrim;
+            COND1.conv.converged  = abs(COND1.conv.dVfinal) < options.tolVolume && abs(COND1.conv.dtlFinal) < options.tolTrim;
+            COND1.conv.history    = history;
         end
     end
 
     methods (Static, Access = private)
+        function R = buildRotation(theta, phi)
+            % theta = trim about y
+            % phi   = heel about x
+            R_T = [1, 0, 0;
+                   0, cos(phi), -sin(phi);
+                   0, sin(phi),  cos(phi)];
+
+            R_L = [ cos(theta), 0, sin(theta);
+                    0,          1, 0;
+                   -sin(theta), 0, cos(theta)];
+
+            R = R_L * R_T;
+        end
+
+        function [subV, subF, nSub, wettedArea] = appendTriangle(subV, subF, nSub, wettedArea, tri)
+            e1 = tri(2,:) - tri(1,:);
+            e2 = tri(3,:) - tri(1,:);
+            area = 0.5 * norm(cross(e1, e2));
+
+            if area <= Algorithms.TOL_AREA
+                return;
+            end
+
+            nSub = nSub + 1;
+            idx = (nSub-1)*3 + (1:3);
+            subV(idx,:) = tri;
+            subF(nSub,:) = idx;
+            wettedArea = wettedArea + area;
+        end
+
         function gd = computeSingleHeel(SHIP, COND_ref, heelAngle, assettoOptions)
             gd = struct('heel', heelAngle, 'trim', nan, 'draft', nan, 'GZ', nan, 'V', nan, 'conv', false);
+
             try
                 COND = COND_ref;
                 COND.tetaT = heelAngle;
                 COND.tetaL = 0;
+
                 COND1 = Algorithms.assetto(COND, SHIP, assettoOptions);
+
                 gd.trim = COND1.tetaL;
                 gd.draft = COND1.T;
                 gd.GZ = COND1.GZ;
                 gd.V = COND1.V;
-                gd.conv = COND1.conv.converged;
+                gd.conv = isfield(COND1, 'conv') && isfield(COND1.conv, 'converged') && COND1.conv.converged;
             catch
                 gd.conv = false;
             end
         end
 
-        function [clippedPoly, wpEdge] = clipTriangleToWaterplane(tri)
-            % FIXED: Handle edge cases better
-            clippedPolyBuf = zeros(4, 3);
-            wpEdgeBuf = zeros(2, 3);
+        function [clippedPoly, wpPoints] = clipTriangleToWaterplane(tri)
+            tol = Algorithms.TOL_GEOM;
+
+            clippedBuf = zeros(4,3);
+            wpBuf = zeros(2,3);
             nClip = 0;
             nWp = 0;
-            n = size(tri, 1);
 
-            % Tolerance for numerical comparisons
-            tol = 1e-12;
-
-            % Early-return: all vertices on the waterplane — whole triangle is
-            % submerged and every edge is a waterplane edge.
             if all(abs(tri(:,3)) <= tol)
                 clippedPoly = tri;
-                wpEdge      = tri;
+                wpPoints = tri(:, :);
                 return;
             end
 
-            for i = 1:n
-                iNext = mod(i, n) + 1;
-                pCurr = tri(i, :);
-                pNext = tri(iNext, :);
-                zCurr = pCurr(3);
-                zNext = pNext(3);
+            for i = 1:3
+                j = mod(i,3) + 1;
 
-                % FIXED: Use tolerance for comparisons
-                currInside = zCurr <= tol;
-                nextInside = zNext <= tol;
+                p1 = tri(i,:);
+                p2 = tri(j,:);
+                z1 = p1(3);
+                z2 = p2(3);
 
-                if currInside
+                in1 = z1 <= tol;
+                in2 = z2 <= tol;
+
+                if in1
                     nClip = nClip + 1;
-                    clippedPolyBuf(nClip, :) = pCurr;
+                    clippedBuf(nClip,:) = p1;
                 end
 
-                if currInside ~= nextInside
-                    % Compute intersection with z=0 plane
-                    if abs(zNext - zCurr) > tol
-                        t = -zCurr / (zNext - zCurr);
-                        t = max(0, min(1, t));  % Clamp to [0,1]
-                        pInt = pCurr + t * (pNext - pCurr);
-                        pInt(3) = 0;  % Force exactly zero
+                if xor(in1, in2)
+                    dz = z2 - z1;
+                    if abs(dz) > tol
+                        t = -z1 / dz;
+                        t = max(0, min(1, t));
+                        pint = p1 + t * (p2 - p1);
+                        pint(3) = 0;
+
                         nClip = nClip + 1;
-                        clippedPolyBuf(nClip, :) = pInt;
+                        clippedBuf(nClip,:) = pint;
+
                         nWp = nWp + 1;
-                        wpEdgeBuf(nWp, :) = pInt;
+                        wpBuf(nWp,:) = pint;
+                    end
+                elseif abs(z1) <= tol && abs(z2) <= tol
+                    % whole edge on waterplane; keep endpoints as candidate points
+                    if nWp + 2 <= size(wpBuf,1)
+                        nWp = nWp + 1;
+                        wpBuf(nWp,:) = p1;
+                        if norm(p2 - p1) > tol
+                            nWp = nWp + 1;
+                            wpBuf(nWp,:) = p2;
+                        end
                     end
                 end
             end
 
-            clippedPoly = clippedPolyBuf(1:nClip, :);
-            wpEdge = wpEdgeBuf(1:nWp, :);
+            clippedPoly = clippedBuf(1:nClip,:);
+            wpPoints = wpBuf(1:nWp,:);
         end
 
-        function [Af, Lwl, Bwl, F_world, Ix, Iy] = computeWaterplaneProperties(waterEdges)
-            % FIXED: Improved waterplane area calculation
-            % Returns NaN for invalid cases instead of wrong values
+        function [Af, Lwl, Bwl, F_world, Ix, Iy] = computeWaterplaneProperties(wpPts)
+            Af = 0;
+            Lwl = 0;
+            Bwl = 0;
+            F_world = [NaN, NaN, NaN];
+            Ix = 0;
+            Iy = 0;
 
-            Af = 0; Lwl = 0; Bwl = 0; F_world = [NaN, NaN, NaN]; Ix = 0; Iy = 0;
-
-            if size(waterEdges, 1) < 3
+            if size(wpPts,1) < 3
                 return;
             end
 
-            xy = waterEdges(:, 1:2);
+            xy = wpPts(:,1:2);
+            xy = Algorithms.uniqueTolRows(xy, 1e-9);
 
-            % Remove duplicate points
-            [xy, ~, ~] = unique(xy, 'rows', 'stable');
-
-            if size(xy, 1) < 3
+            if size(xy,1) < 3
                 return;
             end
 
-            % Compute centroid
-            centroid = mean(xy, 1);
+            % Convex hull is safer than centroid-angle sorting on raw noisy points.
+            % It may under-represent concave geometries, but it avoids self-crossing
+            % polygons and catastrophic area errors.
+            try
+                k = convhull(xy(:,1), xy(:,2));
+            catch
+                return;
+            end
 
-            % Sort by angle around centroid (for simple convex/concave polygons)
-            angles = atan2(xy(:, 2) - centroid(2), xy(:, 1) - centroid(1));
-            [~, sortIdx] = sort(angles);
-            xySorted = xy(sortIdx, :);
+            if numel(k) < 4
+                return;
+            end
 
-            % Vectorised shoelace — build shifted-index arrays once
-            n    = size(xySorted, 1);
-            iN   = [2:n, 1]';                   % next-vertex indices
-            x    = xySorted(:, 1);
-            y    = xySorted(:, 2);
-            xN   = x(iN);
-            yN   = y(iN);
-            cp   = x .* yN - xN .* y;           % cross-product per edge
+            poly = xy(k(1:end-1), :);
+            x = poly(:,1);
+            y = poly(:,2);
 
-            Af = abs(sum(cp)) / 2;
+            n = numel(x);
+            j = [2:n, 1]';
+            xj = x(j);
+            yj = y(j);
 
-            if Af <= 1e-9
+            cp = x .* yj - xj .* y;
+            A_signed = 0.5 * sum(cp);
+            Af = abs(A_signed);
+
+            if Af < Algorithms.MIN_WP_AREA
                 Af = 0;
                 return;
             end
 
-            % Vectorised centroid
-            cx = sum((x + xN) .* cp) / (6 * Af);
-            cy = sum((y + yN) .* cp) / (6 * Af);
-            F_world = [cx, cy, 0];
+            denom = 6 * A_signed;
+            if abs(denom) < Algorithms.TOL_GEOM
+                Af = 0;
+                return;
+            end
 
-            % FIXED: Compute Lwl and Bwl from sorted polygon extents
+            cx = sum((x + xj) .* cp) / denom;
+            cy = sum((y + yj) .* cp) / denom;
+
+            F_world = [cx, cy, 0];
             Lwl = max(x) - min(x);
             Bwl = max(y) - min(y);
 
-            % Vectorised second moments of area (about origin, then corrected)
-            Ix = abs(sum((y.^2 + y.*yN + yN.^2) .* cp)) / 12;
-            Iy = abs(sum((x.^2 + x.*xN + xN.^2) .* cp)) / 12;
+            Ix0 = sum((y.^2 + y.*yj + yj.^2) .* cp) / 12;
+            Iy0 = sum((x.^2 + x.*xj + xj.^2) .* cp) / 12;
 
-            % Parallel axis theorem to get moments about centroid
-            Ix = Ix - Af * cy^2;
-            Iy = Iy - Af * cx^2;
+            Ix = abs(Ix0 - A_signed * cy^2);
+            Iy = abs(Iy0 - A_signed * cx^2);
 
-            % Ensure non-negative
-            Ix = max(0, Ix);
-            Iy = max(0, Iy);
+            Ix = max(Ix, 0);
+            Iy = max(Iy, 0);
         end
 
         function COND1 = setEmptyHydrostatics(COND)
             COND1 = COND;
-            COND1.V = 0;
-            COND1.B = [NaN, NaN, NaN];
-            COND1.Af = 0;
-            COND1.I = [0, 0];
+            COND1.V   = 0;
+            COND1.B   = [NaN, NaN, NaN];
+            COND1.Af  = 0;
+            COND1.I   = [0, 0];
             COND1.Lwl = 0;
             COND1.Bwl = 0;
-            COND1.F = [NaN, NaN, NaN];
+            COND1.F   = [NaN, NaN, NaN];
             COND1.Ams = 0;
-            COND1.Ws = 0;
+            COND1.Ws  = 0;
         end
 
         function [COND, iter, residual] = solveVolumeEquilibrium(COND, V0, geometryFunc, options)
@@ -479,377 +518,330 @@ classdef Algorithms
             residual = inf;
             alpha = 1.0;
 
-            % FIXED: Initialize residual properly
-            if ~isnan(COND.V) && COND.V > 0
+            if isfinite(COND.V) && COND.V > Algorithms.MIN_VOL
                 residual = abs((V0 - COND.V) / V0);
             end
 
             while residual > options.tolVolume && iter < options.maxIter
                 iter = iter + 1;
-                dV = V0 - COND.V;
 
-                if abs(V0) < 1e-12
+                if ~isfinite(COND.V) || COND.Af < Algorithms.MIN_WP_AREA
                     break;
                 end
 
+                dV = V0 - COND.V;
                 residual = abs(dV / V0);
+
                 if residual <= options.tolVolume
                     break;
                 end
 
-                Af = max(COND.Af, 1e-6);
-                dT = dV / Af;
+                dT = dV / max(COND.Af, Algorithms.MIN_WP_AREA);
+
                 alpha = Algorithms.lineSearchVolume(COND, V0, dT, alpha, geometryFunc);
-                COND.T = COND.T + alpha * dT;
+
+                Tnew = COND.T + alpha * dT;
+                if ~isfinite(Tnew)
+                    break;
+                end
+
+                COND.T = Tnew;
                 COND = geometryFunc(COND);
 
-                if iter > 1
+                if isfinite(COND.V)
                     newResidual = abs((V0 - COND.V) / V0);
-                    if newResidual > residual * 0.9
-                        alpha = max(0.5, alpha * 0.8);
+                    if newResidual > residual * 0.95
+                        alpha = max(0.2, 0.8 * alpha);
                     else
-                        alpha = min(1.0, alpha * 1.1);
+                        alpha = min(1.0, 1.05 * alpha);
                     end
+                    residual = newResidual;
+                else
+                    break;
                 end
             end
         end
 
         function [COND, iter, residual, history] = solveTrimEquilibrium(COND, V0, geometryFunc, options, history)
             iter = 0;
-            residual = inf;
-            relaxation = options.relaxation;
-
-            % FIXED: Initialize residual properly
             dtl = Algorithms.computeTrimCorrection(COND);
             residual = abs(dtl);
+            relaxation = options.relaxation;
 
             while residual > options.tolTrim && iter < options.maxIter
                 iter = iter + 1;
-                residual = abs(dtl);
-                COND.tetaL = COND.tetaL + relaxation * dtl;
+
+                if ~isfinite(dtl)
+                    break;
+                end
+
+                oldResidual = residual;
+
+                step = relaxation * dtl;
+                step = max(-Algorithms.MAX_TRIM_STEP_DEG, min(Algorithms.MAX_TRIM_STEP_DEG, step));
+
+                COND.tetaL = COND.tetaL + step;
                 COND = geometryFunc(COND);
 
-                volumeTol = options.tolVolume * 10;
+                if ~isfinite(COND.V) || COND.Af < Algorithms.MIN_WP_AREA
+                    break;
+                end
+
                 volIter = 0;
+                volumeTol = 10 * options.tolVolume;
                 dV = V0 - COND.V;
 
                 while abs(dV / V0) > volumeTol && volIter < 20
                     volIter = volIter + 1;
-                    Af = max(COND.Af, 1e-6);
-                    COND.T = COND.T + dV / Af;
+
+                    dT = dV / max(COND.Af, Algorithms.MIN_WP_AREA);
+                    COND.T = COND.T + dT;
                     COND = geometryFunc(COND);
+
+                    if ~isfinite(COND.V) || COND.Af < Algorithms.MIN_WP_AREA
+                        break;
+                    end
+
                     dV = V0 - COND.V;
                 end
 
                 dtl = Algorithms.computeTrimCorrection(COND);
+                residual = abs(dtl);
 
                 if iter > 1
-                    if abs(dtl) > residual * 0.95
-                        relaxation = max(0.3, relaxation * 0.9);
+                    if residual > 0.95 * oldResidual
+                        relaxation = max(0.25, 0.85 * relaxation);
                     else
-                        relaxation = min(options.relaxation, relaxation * 1.05);
+                        relaxation = min(options.relaxation, 1.02 * relaxation);
                     end
                 end
 
-                history.volume = [history.volume; COND.V];
-                history.trim = [history.trim; COND.tetaL];
-                history.draft = [history.draft; COND.T];
+                history.volume(end+1,1) = COND.V;
+                history.trim(end+1,1)   = COND.tetaL;
+                history.draft(end+1,1)  = COND.T;
             end
         end
 
         function alpha = lineSearchVolume(COND, V0, dT, alpha0, geometryFunc)
             alpha = alpha0;
             maxTry = 5;
-            COND_test = COND;
-            COND_test.T = COND.T + alpha * dT;
-            COND_test = geometryFunc(COND_test);
 
-            if abs(V0) < 1e-12
+            if ~isfinite(dT) || abs(V0) < Algorithms.MIN_VOL
                 return;
             end
 
-            residual_new = abs((V0 - COND_test.V) / V0);
-            residual_old = abs((V0 - COND.V) / V0);
-            tries = 0;
+            residualOld = abs((V0 - COND.V) / V0);
 
-            while residual_new > residual_old * 1.5 && tries < maxTry && alpha > 0.1
-                alpha = alpha * 0.5;
-                COND_test.T = COND.T + alpha * dT;
-                COND_test = geometryFunc(COND_test);
-                residual_new = abs((V0 - COND_test.V) / V0);
-                tries = tries + 1;
+            for k = 1:maxTry
+                test = COND;
+                test.T = COND.T + alpha * dT;
+                test = geometryFunc(test);
+
+                if ~isfinite(test.V)
+                    alpha = 0.5 * alpha;
+                    continue;
+                end
+
+                residualNew = abs((V0 - test.V) / V0);
+                if residualNew <= 1.5 * residualOld || alpha <= 0.1
+                    return;
+                end
+
+                alpha = 0.5 * alpha;
             end
         end
 
         function dtl = computeTrimCorrection(COND)
-            % FIXED: Improved trim correction calculation
-            % Bow-down (negative trim by stern) should give positive correction
-
-            tetaTrad = COND.tetaT * pi / 180;
-            tetaLrad = COND.tetaL * pi / 180;
-
-            % Unit vector in longitudinal direction (in ship coordinates)
-            % FIXED: Sign convention - positive trim by stern means bow is up
-            % Rotation matrix for trim (pitch about y-axis, positive = bow up)
-            % R_L = [cos(tetaL), 0, sin(tetaL); 0, 1, 0; -sin(tetaL), 0, cos(tetaL)]
-            % After rotation, the longitudinal direction in world frame is:
-            PI = [-cos(tetaTrad)*sin(tetaLrad), -sin(tetaTrad)*cos(tetaLrad), cos(tetaTrad)*cos(tetaLrad)];
-
-            if COND.V > 1e-9 && COND.I(2) > 1e-9
-                RL = COND.I(2) / COND.V;
-                ML = COND.B + RL * PI;
-            else
+            if ~isfield(COND, 'B') || ~isfield(COND, 'G') || ~isfield(COND, 'I') || ~isfield(COND, 'V')
                 dtl = 0;
                 return;
             end
+
+            if any(~isfinite(COND.B)) || any(~isfinite(COND.G)) || ~isfinite(COND.V) || COND.V <= Algorithms.MIN_VOL
+                dtl = 0;
+                return;
+            end
+
+            if numel(COND.I) < 2 || ~isfinite(COND.I(2)) || COND.I(2) <= Algorithms.TOL_GEOM
+                dtl = 0;
+                return;
+            end
+
+            phi   = deg2rad(COND.tetaT);
+            theta = deg2rad(COND.tetaL);
+
+            % Approximate longitudinal metacentre direction in ship frame/world-aligned logic
+            PI = [-cos(phi) * sin(theta), ...
+                  -sin(phi) * cos(theta), ...
+                   cos(phi) * cos(theta)];
+
+            RL = COND.I(2) / COND.V;
+            ML = COND.B + RL * PI;
 
             BML = ML - COND.B;
             GML = ML - COND.G;
-            normBML = norm(BML);
-            normGML = norm(GML);
 
-            if normBML < 1e-12 || normGML < 1e-12
+            n1 = norm(BML);
+            n2 = norm(GML);
+
+            if n1 < Algorithms.TOL_GEOM || n2 < Algorithms.TOL_GEOM
                 dtl = 0;
                 return;
             end
 
-            % Compute angle between BML and GML in the longitudinal plane
-            % Positive correction means bow-down trimming moment needed
             dotProd = dot(BML, GML);
-            crossProd = BML(1)*GML(3) - BML(3)*GML(1);
+            crossXZ = BML(1) * GML(3) - BML(3) * GML(1);
 
-            % Angle in degrees
-            dtl = atan2(crossProd, dotProd) * 180/pi;
-
-            % Limit to reasonable range
-            % Clamp to small angles to avoid atan2 instability
-            % When angle approaches 180 deg, atan2 becomes very sensitive
-            dtl = max(-15, min(15, dtl));
+            dtl = rad2deg(atan2(crossXZ, dotProd));
+            dtl = max(-Algorithms.MAX_TRIM_STEP_DEG, min(Algorithms.MAX_TRIM_STEP_DEG, dtl));
         end
 
         function COND = computeRightingLever(COND)
-            % FIXED: Completely rewritten righting lever calculation
-            % The GZ is the horizontal distance from G to the line of action of buoyancy
-            %
-            % In the rotated (world) coordinate system:
-            % - Gravity acts in -Z direction
-            % - Buoyancy acts in +Z direction (normal to waterplane)
-            %
-            % GZ = |GB| * sin(phi) where phi is the angle between GB and the vertical
-
-            if any(isnan(COND.B)) || any(isnan(COND.G))
+            if any(~isfinite(COND.B)) || any(~isfinite(COND.G))
                 COND.GZ = NaN;
                 return;
             end
 
-            % Heel and trim angles in radians
-            tetaTrad = COND.tetaT * pi / 180;
-            tetaLrad = COND.tetaL * pi / 180;
+            phi   = deg2rad(COND.tetaT);
+            theta = deg2rad(COND.tetaL);
+            R = Algorithms.buildRotation(theta, phi);
 
-            % Build rotation matrix: ship coordinates -> world coordinates
-            % R_T: roll about the x-axis (heel, positive = starboard down)
-            R_T = [1, 0, 0;
-                   0, cos(tetaTrad), -sin(tetaTrad);
-                   0, sin(tetaTrad), cos(tetaTrad)];
+            G_world = (R * COND.G(:)).';
+            B_world = (R * COND.B(:)).';
 
-            % R_L: pitch about the y-axis (trim, positive = bow up)
-            R_L = [cos(tetaLrad), 0, sin(tetaLrad);
-                   0, 1, 0;
-                   -sin(tetaLrad), 0, cos(tetaLrad)];
+            % Distance from G to vertical buoyancy line through B
+            d = G_world - B_world;
+            gzMag = hypot(d(1), d(2));
 
-            % Combined rotation: ship -> world
-            R = R_L * R_T;
-
-            % In world coordinates, vertical is Z direction
-            % The righting lever is the horizontal component perpendicular to the
-            % plane formed by the buoyancy force (vertical) and the BG vector
-            %
-            % Simplified: GZ = horizontal distance from G to vertical through B
-            % In world frame, this is the magnitude of the horizontal components
-            % of the vector from B to G
-
-            % Actually, let's use the classical definition:
-            % GZ = (KB + BM - KG) * sin(heel) for small angles
-            % But for large angles, we need the cross product approach
-
-            % Vector from G to B
-            GB = COND.B - COND.G;
-
-            % Unit vector in vertical direction (world frame)
-            k_world = [0, 0, 1];
-
-            % The righting moment arm GZ is the component perpendicular to gravity
-            % GZ_vector = (GB . k) * k - GB  <- projection onto horizontal plane
-            % But actually, we want the perpendicular distance from G to buoyancy line
-
-            % In world frame, buoyancy acts upward (+Z), gravity acts downward (-Z)
-            % The line of action of buoyancy passes through B and is vertical
-            % GZ is the horizontal distance from G to this line
-
-            % Transform G and B from ship coordinates to world coordinates.
-            % In the world frame the waterplane is horizontal and gravity acts in -Z.
-            % GZ is the perpendicular (horizontal) distance from G to the vertical
-            % line of action of the buoyancy force, which passes through B_world.
-            G_world = (R * COND.G')';
-            B_world = (R * COND.B')';
-
-            % In world frame, the vertical is Z
-            % The horizontal plane is XY
-            % GZ is the horizontal distance from G to the vertical line through B
-            % Projected onto the direction perpendicular to both the ship's
-            % longitudinal axis and the vertical
-
-            % For a static GZ curve, we typically report the GZ in the
-            % plane of symmetry (for symmetric hulls)
-            % This is the y-component of the vector from the line of action
-            % of buoyancy to G
-
-            % Simpler: The righting lever is the moment arm
-            % GZ = |GB x F_buoyancy_unit|
-            % but projected onto the transverse direction
-
-            % Let me use the most straightforward approach:
-            % GZ = (ZB - ZG) * sin(phi) for small angles
-            % But we need the exact value for large angles
-
-            % The restoring moment is: M_r = rho * g * V * GZ
-            % where GZ is the perpendicular distance from G to the line of action of buoyancy
-
-            % Line of action of buoyancy in world frame: passes through B_world, direction [0,0,1]
-            % Distance from G_world to this line:
-            % d = | (G_world - B_world) x [0,0,1] |
-
-            diff = G_world - B_world;
-            cross_prod = cross(diff, [0, 0, 1]);
-
-            % The magnitude of the cross product gives the perpendicular distance
-            gz_magnitude = norm(cross_prod);
-
-            % The sign of GZ: positive for righting moment (restoring)
-            % For a positive heel angle (port side up), if G is to starboard of B,
-            % we have a restoring moment
-            %
-            % In world frame after positive heel about X:
-            % - Y positive is to port (original)
-            % - Z positive is up
-            %
-            % For a restoring moment, G should be "above and to the side" of B
-            % such that the moment brings the ship back
-
-            % Sign determination:
-            % If cross_prod(1) < 0, the moment is restoring for positive heel
-            % Actually, let's look at the geometry:
-            % At positive heel, the ship rotates so port side goes up
-            % B moves to port (positive Y in world frame)
-            % If G is above B's new position, there's a restoring moment
-
-            % The sign convention: positive GZ = restoring (stability)
-            % For positive heel: if G is to starboard of B's line of action, GZ > 0
-
-            % Sign convention:
-            %   cross([dx,dy,dz], [0,0,1]) = [dy, -dx, 0]
-            %   For a positive heel (starboard down), B moves to the low side
-            %   (negative Y in world frame) while G stays near Y=0 for a
-            %   symmetric hull, so diff(2) = G_world(2)-B_world(2) > 0,
-            %   which gives cross_prod(1) > 0 — a restoring (positive) GZ. ✓
-            if cross_prod(1) > 0
-                COND.GZ = gz_magnitude;  % Restoring
-            else
-                COND.GZ = -gz_magnitude; % Capsizing
+            if gzMag < Algorithms.TOL_GEOM
+                COND.GZ = 0;
+                return;
             end
 
-            % Alternative simpler formula for small angles:
-            % GZ = GM * sin(heel), but this is approximate
+            % Sign convention:
+            % positive GZ should correspond to restoring moment for positive heel.
+            % For roll about x with gravity in -z, the restoring moment sign is
+            % governed by the x-component of r x F, where r is from G to B and F is +z.
+            r = B_world - G_world;
+            m = cross(r, [0 0 1]);
+            mx = m(1);
+
+            if COND.tetaT >= 0
+                sgn = sign(mx);
+            else
+                sgn = -sign(mx);
+            end
+
+            if sgn == 0
+                sgn = 1;
+            end
+
+            COND.GZ = sgn * gzMag;
         end
 
         function Ams = computeMidshipArea(subV, subF, xMid)
-            % COMPUTEMIDSHIPAREA  Transverse cross-sectional area of the submerged
-            % mesh at the longitudinal position x = xMid (default 0).
-            %
-            % Collects every triangle edge that crosses the plane x=xMid,
-            % projects the intersection points onto the (y,z) plane, sorts them
-            % by angle around their centroid, and applies the shoelace formula.
-            %
-            % Assumptions:
-            %   - The hull is symmetric and centred at x = 0.
-            %   - The cross-section is convex (angle-sort gives correct winding).
-            %     For non-convex sections (catamarans, etc.) the result will
-            %     overestimate area — flag as a known limitation.
-
             if nargin < 3 || isempty(xMid)
                 xMid = 0;
             end
 
             tol = 1e-10;
-            yzPoints = zeros(0, 2);
+            yzPoints = zeros(0,2);
 
-            nF = size(subF, 1);
+            nF = size(subF,1);
             for f = 1:nF
-                v   = subV(subF(f, :), :);   % 3×3 triangle vertices (world frame)
-                xv  = v(:, 1) - xMid;        % x relative to slice plane
+                tri = subV(subF(f,:), :);
+                xv = tri(:,1) - xMid;
 
                 for i = 1:3
-                    j  = mod(i, 3) + 1;
+                    j = mod(i,3) + 1;
                     xi = xv(i);
                     xj = xv(j);
 
                     if (xi < -tol && xj > tol) || (xi > tol && xj < -tol)
-                        % Edge crosses the plane strictly — interpolate
                         t = -xi / (xj - xi);
                         t = max(0, min(1, t));
-                        p = v(i, :) + t * (v(j, :) - v(i, :));
-                        yzPoints(end + 1, :) = p(2:3); %#ok<AGROW>
+                        p = tri(i,:) + t * (tri(j,:) - tri(i,:));
+                        yzPoints(end+1,:) = p(2:3); %#ok<AGROW>
                     elseif abs(xi) <= tol
-                        % Vertex lies exactly on the slice plane
-                        yzPoints(end + 1, :) = v(i, 2:3); %#ok<AGROW>
+                        yzPoints(end+1,:) = tri(i,2:3); %#ok<AGROW>
                     end
                 end
             end
 
-            if size(yzPoints, 1) < 3
+            if size(yzPoints,1) < 3
                 Ams = 0;
                 return;
             end
 
-            % De-duplicate points that are numerically identical
-            yzRnd = round(yzPoints * 1e8) / 1e8;
-            [~, ia] = unique(yzRnd, 'rows', 'stable');
-            yzPoints = yzPoints(ia, :);
-
-            if size(yzPoints, 1) < 3
+            yzPoints = Algorithms.uniqueTolRows(yzPoints, 1e-8);
+            if size(yzPoints,1) < 3
                 Ams = 0;
                 return;
             end
 
-            % Sort by angle around centroid (shoelace requires consistent winding)
-            c      = mean(yzPoints, 1);
-            angles = atan2(yzPoints(:, 2) - c(2), yzPoints(:, 1) - c(1));
-            [~, idx]  = sort(angles);
-            yz     = yzPoints(idx, :);
+            % Use convex hull for robustness against self-crossing sort orders
+            try
+                k = convhull(yzPoints(:,1), yzPoints(:,2));
+            catch
+                Ams = 0;
+                return;
+            end
 
-            % Vectorised shoelace
-            n    = size(yz, 1);
-            jIdx = [2:n, 1]';
-            Ams  = abs(sum(yz(:,1) .* yz(jIdx,2) - yz(jIdx,1) .* yz(:,2))) / 2;
+            if numel(k) < 4
+                Ams = 0;
+                return;
+            end
+
+            yz = yzPoints(k(1:end-1), :);
+            x = yz(:,1);
+            y = yz(:,2);
+
+            n = numel(x);
+            j = [2:n, 1]';
+            Ams = 0.5 * abs(sum(x .* y(j) - x(j) .* y));
         end
 
         function validateInputs(COND, SHIP, options)
-            required = {'V', 'tetaT', 'tetaL', 'T', 'G'};
+            required = {'V','tetaT','tetaL','T','G'};
             for k = 1:numel(required)
                 if ~isfield(COND, required{k})
-                    error('Algorithms:missingField', 'COND missing required field: .%s', required{k});
+                    error('Algorithms:MissingField', 'COND is missing required field ".%s".', required{k});
                 end
             end
+
             if ~isstruct(SHIP)
-                error('Algorithms:invalidSHIP', 'SHIP must be a struct.');
+                error('Algorithms:InvalidSHIP', 'SHIP must be a struct.');
             end
-            if options.useMesh
-                if ~isfield(SHIP, 'vertices') || ~isfield(SHIP, 'faces')
-                    error('Algorithms:invalidMesh', 'Mesh SHIP must have vertices and faces fields.');
+
+            if ~isfield(options, 'useMesh') || ~options.useMesh
+                error('Algorithms:CellModeUnsupported', 'This pipeline currently supports mesh mode only.');
+            end
+
+            if ~isfield(SHIP, 'vertices') || ~isfield(SHIP, 'faces')
+                error('Algorithms:InvalidMesh', 'SHIP must contain "vertices" and "faces".');
+            end
+
+            if ~isnumeric(COND.G) || numel(COND.G) ~= 3 || any(~isfinite(COND.G))
+                error('Algorithms:InvalidG', 'COND.G must be a finite 1x3 or 3x1 numeric vector.');
+            end
+        end
+
+        function S = applyDefaults(S, defaults)
+            names = fieldnames(defaults);
+            for i = 1:numel(names)
+                if ~isfield(S, names{i})
+                    S.(names{i}) = defaults.(names{i});
                 end
-            else
-                error('Algorithms:cellModeUnsupported', 'Class-only pipeline supports mesh mode only.');
             end
+        end
+
+        function A = uniqueTolRows(A, tol)
+            if isempty(A)
+                return;
+            end
+            Ar = round(A / tol) * tol;
+            [~, ia] = unique(Ar, 'rows', 'stable');
+            A = A(ia, :);
         end
     end
 end
