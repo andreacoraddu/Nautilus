@@ -2,7 +2,7 @@
 
 [![MATLAB](https://img.shields.io/badge/MATLAB-R2019b+-orange.svg)](https://mathworks.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![DOI](https://img.shields.io/badge/DOI-10.5281/zenodo.XXXXXXX-blue.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+[![DOI](https://img.shields.io/badge/DOI-10.5281/zenodo.19445212-blue.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
 
 > A MATLAB toolkit for ship hydrostatic and stability analysis using mesh-based methods.
 
