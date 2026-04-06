@@ -29,7 +29,7 @@ cd(repoRoot);
 % List of hull geometries to be processed.
 % Each entry should correspond to a hull mesh or geometry definition
 % available in the Hulls folder.
-hulls = {'Wigley_hull_mesh'};
+hulls = {'BoxBarge_mesh'};
 
 % Draft sweep definition.
 % The bundled Wigley benchmark has:
