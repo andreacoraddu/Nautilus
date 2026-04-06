@@ -94,6 +94,20 @@ $$GZ = \| (\mathbf{G} - \mathbf{B}) \times \mathbf{k} \|$$
 ## Citing
 
 ```bibtex
+@article{Coraddu2012WaveProfileStability,
+  author    = {A. Coraddu and P. Gualeni and D. Villa},
+  title     = {Investigation about wave profile effects on ship stability},
+  booktitle = {Sustainable Maritime Transportation and Exploitation of Sea Resources - Proceedings of the 14th International Congress of the International Maritime Association of the Mediterranean, IMAM 2011},
+  editor    = {Enrico Rizzuto and Carlos Guedes Soares},
+  pages     = {143--149},
+  year      = {2012},
+  isbn      = {9780415620826},
+  doi       = {10.1201/b11810-25},
+  language  = {English},
+  address   = {Genova, Italy},
+  note      = {14th International Congress of the International Maritime Association of the Mediterranean (IMAM 2011), Genova, Italy, 13--16 September 2011}
+}
+
 @misc{nautilus2026,
   author = {Andrea Coraddu},
   title = {NAUTILUS — Ship Hydrostatics in MATLAB},
