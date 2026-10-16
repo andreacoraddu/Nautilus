@@ -1,0 +1,36 @@
+{
+    // ---------------------------------------------------------------------
+    // FREE / LICENCE-FREE SETUP (GNU Octave)
+    // ---------------------------------------------------------------------
+    // Uncomment the next line ONLY if you do not have a MATLAB licence.
+    // It tells VS Code to treat .m files as Octave source so that the free
+    // "Octave Language" extension provides syntax highlighting and snippets
+    // instead of VS Code showing .m files as plain text.
+    //
+    // "files.associations": { "*.m": "octave" },
+
+    // ---------------------------------------------------------------------
+    // Shared editor defaults (harmless for both MATLAB and Octave users)
+    // ---------------------------------------------------------------------
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "editor.detectIndentation": false,
+    // MATLAB's own editor uses a 4-space indent; formatting is done by
+    // MATLAB/Octave tooling, not by VS Code, so keep format-on-save off to
+    // avoid rewriting the author's alignment of tables/arrays.
+    "editor.formatOnSave": false,
+    "files.trimTrailingWhitespace": false,
+
+    // Generated artefacts (figures, DAT/TXT tables, MAT files) are written
+    // here by the pipeline; keep them out of search results.
+    "search.exclude": {
+        "Output/**": true
+    },
+    "files.watcherExclude": {
+        "Output/**": true
+    },
+
+    // Run tasks/terminals from the repository root: main.m resolves paths
+    // relative to the repo root (see main.m, repoRoot/addpath block).
+    "terminal.integrated.cwd": "${workspaceFolder}"
+}

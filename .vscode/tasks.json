@@ -1,0 +1,69 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            // Requires a licensed, locally installed MATLAB (R2019a+ for -batch).
+            "label": "MATLAB: run main.m",
+            "type": "shell",
+            "command": "matlab",
+            "args": [
+                "-batch",
+                "main"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            // 100% free path: runs the same entry point with GNU Octave.
+            // Expect a few MATLAB-only constructs to need patching first
+            // (see .vscode/README.md).
+            "label": "Octave: run main.m (free)",
+            "type": "shell",
+            "command": "octave",
+            "args": [
+                "--no-gui",
+                "--quiet",
+                "main.m"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            // Handy for the generators in Hulls/ (generate_wigley_hull.m, ...).
+            "label": "MATLAB: run current file",
+            "type": "shell",
+            "command": "matlab",
+            "args": [
+                "-batch",
+                "run('${file}')"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Octave: run current file (free)",
+            "type": "shell",
+            "command": "octave",
+            "args": [
+                "--no-gui",
+                "--quiet",
+                "${file}"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

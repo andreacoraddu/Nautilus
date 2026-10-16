@@ -1,0 +1,26 @@
+{
+    // Recommended extensions for this repository.
+    //
+    // NOTE ON COST / LICENSING
+    // ------------------------
+    // The MathWorks extension itself is free (MIT, published on the VS Code
+    // Marketplace as MathWorks.language-matlab), but its advanced features
+    // (code analysis, navigation, formatting, running, debugging) all require
+    // a *licensed* MATLAB installation on your machine (R2021b or newer).
+    // Without a MATLAB licence you only get plain editing features, so the
+    // extension is only worth installing if you already have MATLAB access
+    // (campus licence, MATLAB Online, employer licence, ...).
+    //
+    // If you do NOT have a MATLAB licence, install the free GNU Octave
+    // extension instead (leafvmaple.octave) and install GNU Octave itself
+    // (https://octave.org/download). See .vscode/README.md in this folder for
+    // the full free setup, together with the list of MATLAB-only constructs
+    // used by this code base (tiledlayout, latex interpreter, arguments
+    // blocks, property validation) that must be patched for Octave.
+    "recommendations": [
+        // Paid engine, free extension - use only if you have a MATLAB licence.
+        "MathWorks.language-matlab",
+        // 100% free path: syntax highlighting / run support through GNU Octave.
+        "leafvmaple.octave"
+    ]
+}
